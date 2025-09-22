@@ -1,10 +1,10 @@
-FROM cgr.dev/chainguard/node:latest
+FROM node:latest
 
 WORKDIR /app
 
-COPY --chown=node:node package.json package-lock.json ./
+COPY package.json package-lock.json ./
 RUN npm install
 
-COPY --chown=node:node server.js .
+COPY server.js .
 
 CMD ["npm", "start"]
