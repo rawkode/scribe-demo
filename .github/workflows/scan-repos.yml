@@ -5,7 +5,10 @@ on:
 
 jobs:
     github-discovery-demo-usage:
-      
+      permissions:
+        id-token: write
+        contents: read
+
       uses: scribe-public/reusable-workflows/.github/workflows/github-discovery-demo.yaml@main
       with:
         number_of_repos: 5

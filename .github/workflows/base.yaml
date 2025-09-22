@@ -1,0 +1,261 @@
+name: K8s Discovery and Evaluation Demo
+
+on:
+  workflow_call:
+    inputs:
+      scribe_valint_url:
+        description: "Scribe Valint URL"
+        required: false
+        type: string
+        default: "https://api.scribesecurity.com"
+      scribe_product_name:
+        description: "Scribe Product Name"
+        required: false
+        default: "My-First-Product"
+        type: string
+      scribe_product_version:
+        description: "Scribe Product Version"
+        required: false
+        default: "1.0.0"
+        type: string
+      targets:
+        description: "Comma-separated list of Docker images for demo"
+        required: true
+        default: "nginx:latest"
+        type: string
+      policy_branch:
+        description: "Policy branch for verification"
+        required: false
+        default: "sh-5883-ssdf"
+        type: string
+      k8s_discovery_args:
+        description: "K8s Discovery arguments"
+        required: false
+        default: ""
+        type: string
+      k8s_bom_args:
+        description: "K8s BOM arguments"
+        required: false
+        default: ""
+        type: string
+      k8s_evidence_args:
+        description: "K8s Evidence arguments"
+        required: false
+        default: ""
+        type: string
+      format:
+        description: "Evidence format"
+        required: false
+        default: "cyclonedx-json"
+        type: string
+      sbom:
+        description: "True if SBOM is to be generated"
+        required: false
+        default: true
+        type: boolean
+      docker-registry:
+        description: "Docker registry"
+        required: false
+        default: "docker.io"
+        type: string
+    secrets:
+      SCRIBE_TOKEN:
+        description: "Scribe token"
+        required: true
+      DOCKERHUB_USERNAME:
+        description: "DockerHub username"
+        required: false
+      DOCKERHUB_PASSWORD:
+        description: "DockerHub password"
+        required: false
+
+
+
+env:
+    PLATFORMS_VERSION: "latest"
+    PLATFORMS_DB_PATH: github.platforms.db
+    VALINT_SCRIBE_URL: ${{ inputs.scribe_valint_url }}
+    VALINT_CONTEXT_TYPE: "github"
+    VALINT_OUTPUT_DIRECTORY: evidence/github
+    LOG_LEVEL: "INFO"
+    VALINT_LOG_LEVEL: "info"
+    VALINT_DISABLE_EVIDENCE_CACHE: false
+    VALINT_SCRIBE_ENABLE: true
+    DOCKER_DRIVER: overlay2
+    DOCKER_CONFIG: ${{ github.workspace }}/.docker
+    DEBUG: false
+    K8S_URL: "Not set"
+    NAMESPACE: "default"
+
+jobs:
+  k8s_evaluation:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    env:
+      #DOCKER_DRIVER: overlay2
+      #DOCKER_CONFIG: ${{ github.workspace }}/.docker
+      SCRIBE_TOKEN: ${{ secrets.SCRIBE_TOKEN }}
+
+
+
+    steps:
+      - name: Pull platforms image
+        run: docker pull scribesecurity/platforms:${{ env.PLATFORMS_VERSION }}
+
+      # - name: Install Scribe Tools
+      #   run: |
+      #     set -x
+      #     curl -sSfL https://get.scribesecurity.com/install.sh  | sh -s -- -t valint -D
+      #     /home/runner/.scribe/bin/valint --version
+      #     docker pull scribesecurity/platforms:${{ env.PLATFORMS_VERSION }}
+
+      - name: Sign in to DockerHub
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.docker-registry }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+
+      - name: Start minikube
+        uses: medyagh/setup-minikube@latest
+
+      - name: Try the cluster!
+        run: |
+          set -x
+          minikube stop || true
+          minikube start --driver=docker
+          eval $(minikube -p minikube docker-env -u)
+          kubectl version
+
+      - name: Get IP
+        run: |
+          echo "K8S_URL=$(kubectl cluster-info | grep 'Kubernetes control plane' | awk '{print $NF}' | sed -r "s/\x1b\[[0-9;]*m//g" )" >> $GITHUB_ENV
+
+      - name: Print IP from env.K8S_URL
+        run: echo "${{ env.K8S_URL }}"
+
+      - name: Create and get token
+        run: |
+          set -x
+          kubectl create serviceaccount my-serviceaccount -o yaml
+          kubectl create clusterrole my-role \
+            --verb=get --verb=watch --verb=list \
+            --resource=secrets,pods,namespaces,deployments,rs.apps
+          kubectl create clusterrolebinding my-sa-admin-binding --clusterrole=my-role --serviceaccount=default:my-serviceaccount
+
+          K8S_TOKEN=$(kubectl create token my-serviceaccount)
+          echo "K8S_TOKEN=$K8S_TOKEN" >> $GITHUB_ENV
+
+
+      - name: Set Namespace Env
+        run: |
+          echo \"${{ inputs.scribe_product_name }}\" | tr '[:upper:]' '[:lower:]'
+          echo "NAMESPACE=$(echo \"${{ inputs.scribe_product_name }}\" | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+
+      - name: Deploy image by digest
+        run: |
+          set -x
+          eval $(minikube docker-env)
+          kubectl create namespace ${{ env.NAMESPACE }} || true
+
+          IFS=',' read -r -a targets <<< "${{ inputs.targets }}"
+
+          for target in "${targets[@]}"; do
+            target=$(echo "$target" | xargs)
+            if [ -z "$target" ]; then continue; fi
+
+            echo "Fetching digest for: $target"
+
+            docker pull "$target"
+
+            # Extract repo digest (e.g., myrepo/myimage@sha256:...)
+            digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$target")
+            if [ -z "$digest" ]; then
+              echo "ERROR: no RepoDigest found for $target"
+              exit 1
+            fi
+            echo "Resolved digest: $digest"
+
+            minikube image load "$digest"
+
+            # safe pod name
+            pod_name=$(echo "$target" | tr ':/.' '-')
+
+            kubectl run "$pod_name"-pod \
+              --image="$digest" \
+              --namespace="${{ env.NAMESPACE }}" \
+              --image-pull-policy=IfNotPresent
+
+            kubectl wait --namespace="${{ env.NAMESPACE }}" \
+              --for=condition=ContainersReady pod/"$pod_name"-pod --timeout=300s || true
+            kubectl describe pod "$pod_name"-pod --namespace="${{ env.NAMESPACE }}"
+
+            pod_status=$(kubectl get pod "$pod_name"-pod --namespace="${{ env.NAMESPACE }}" \
+              --output=jsonpath='{.status.phase}')
+            if [[ "$pod_status" == "Failed" || "$pod_status" == "Succeeded" ]]; then
+              echo "Pod $pod_name-pod terminated with status: $pod_status"
+              exit 1
+            fi
+          done
+
+            # Commented out due to networking issues
+            # - name: Discover
+            #   uses: scribe-security/action-platforms@master
+            #   with:
+            #     command: discover
+            #     platform: k8s
+            #     args: >-
+            #       --token ${{ env.K8S_TOKEN}}
+            #       --namespace.mapping ${{env.NAMESPACE}}::${{inputs.scribe_product_name}}::${{ inputs.scribe_product_version }}
+            #       --pod.mapping *::${{inputs.scribe_product_name}}::${{ inputs.scribe_product_version }}
+
+      - name: Discover K8s
+        run: |
+          set -x
+          docker run --rm --network host -e DEBUG=$DEBUG -e K8S_URL=$K8S_URL -e K8S_TOKEN=$K8S_TOKEN -e SCRIBE_TOKEN=$SCRIBE_TOKEN -e VALINT_SCRIBE_URL=$VALINT_SCRIBE_URL \
+            -e DOCKER_DRIVER=overlay2 -e DOCKER_CONFIG=/dockerconfig \
+            -v $(pwd):/db \
+            -v ${{ github.workspace }}/.docker:/dockerconfig \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            scribesecurity/platforms:${{ env.PLATFORMS_VERSION }} \
+            --db.local.path /db/platforms.db \
+            --log-level DEBUG \
+            discover k8s \
+            --instance minikube \
+            --namespace.mapping ${{env.NAMESPACE}}::${{inputs.scribe_product_name}}::${{ inputs.scribe_product_version }} \
+            --pod.mapping *::${{inputs.scribe_product_name}}::${{ inputs.scribe_product_version }} \
+            ${{ inputs.k8s_discovery_args }} \
+
+
+      - name: BOM K8s
+        if: ${{ inputs.sbom == true }}
+        run: |
+          docker run --rm --network host -e DEBUG=$DEBUG -e K8S_URL=$K8S_URL -e K8S_TOKEN=$K8S_TOKEN -e SCRIBE_TOKEN=$SCRIBE_TOKEN -e VALINT_SCRIBE_URL=$VALINT_SCRIBE_URL \
+            -e DOCKER_DRIVER=overlay2 -e DOCKER_CONFIG=/dockerconfig \
+            -v $(pwd):/db \
+            -v ${{ github.workspace }}/.docker:/dockerconfig \
+            scribesecurity/platforms:${{ env.PLATFORMS_VERSION }} \
+            --db.local.path /db/platforms.db \
+            --log-level DEBUG \
+            bom k8s \
+            --instance minikube \
+            --image.mapping ${{env.NAMESPACE}}::*::*::${{inputs.scribe_product_name}}::${{ inputs.scribe_product_version }} || true \
+            ${{ inputs.k8s_bom_args }} \
+
+      # - name: Verify K8s
+      #   run: |
+          # docker run --rm --network host -e DEBUG=$DEBUG -e K8S_URL=$K8S_URL -e K8S_TOKEN=$K8S_TOKEN -e SCRIBE_TOKEN=$SCRIBE_TOKEN \
+          #   -v $(pwd):/db \
+          #   -v /var/run/docker.sock:/var/run/docker.sock \
+          #   scribesecurity/platforms:${{ env.PLATFORMS_VERSION }} \
+          #   --db.local.path /db/platforms.db \
+          #   verify k8s \
+          #   --instance minikube \
+          #   --image.mapping ${{env.NAMESPACE}}::*::*::${{inputs.scribe_product_name}}::${{ inputs.scribe_product_version }} || true
+
+
+
